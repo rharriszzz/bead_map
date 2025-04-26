@@ -1,39 +1,119 @@
 #!/usr/bin/env python3
-"""
-Map pixels in color masks to bead indices by inferring bead centers,
-ordering beads along the minor-axis cycle, and outputting a color sequence.
-
-Usage:
-    python map_beads.py --masks yellow_mask.png red_mask.png black_mask.png \
-                       --beads-per-row 6.5 \
-                       --output-prefix bead_map
-
-Requires:
-    numpy, scipy, scikit-image
-"""
+import sys
 import numpy as np
 import argparse
 from scipy.spatial import KDTree
 from skimage import io, img_as_bool
+from skimage.color import rgb2gray
 from skimage.measure import label, regionprops
 from skimage.feature import blob_log
+from matplotlib import pyplot as plt
+from scipy.signal import find_peaks
 
 
-def load_masks(mask_paths):
+def load_masks(mask_paths, thresh=0.5):
+    """
+    Read each mask image (JPEG), convert to grayscale, then threshold:
+      pixels <= thresh → False (background)
+      pixels >  thresh → True  (foreground)
+    """
     masks = []
     for path in mask_paths:
         img = io.imread(path)
-        masks.append(img_as_bool(img))
+        # convert to float [0–1] grayscale
+        if img.ndim == 3:
+            gray = rgb2gray(img)
+        else:
+            gray = img.astype(float) / np.max(img)
+        # threshold at half‑grey
+        mask = gray > thresh
+        masks.append(mask)
     return masks
 
 
 def estimate_bead_radius(mask):
-    labels = label(mask)
-    areas = [r.area for r in regionprops(labels) if r.area > 0]
-    if not areas:
+    # explicitly tell label that white (True=1) is background
+    labels = label(mask, background=1)
+    regions = [r for r in regionprops(labels) if r.area > 0]
+    if not regions:
         raise RuntimeError("No bead-like regions in mask to estimate radius.")
-    median_area = np.median(areas)
-    return np.sqrt(median_area / np.pi)
+    areas = [r.area for r in regions]
+    # remove duplicates and sort to inspect unique sizes
+    unique_areas = [float(a) for a in sorted(set(areas))]
+    print("DEBUG: Smallest 100 unique region areas:", unique_areas[:100])
+    # ensure native Python floats in the list for clean printing
+    sorted_areas = [float(a) for a in sorted(areas)]
+    
+    # DEBUG PLOT: log10 of region areas vs region index
+    idx = np.arange(1, len(areas)+1)
+    log_area = np.log10(sorted_areas)
+    plt.figure()
+    plt.plot(idx, log_area, marker='o', linestyle='-')
+    plt.xlabel('Region index')
+    plt.ylabel('log10(region area)')
+    plt.title('Bead region sizes')
+    plt.show()
+
+    # DEBUG: Display the largest connected region alongside the plot
+    # Identify the region with the maximum area
+    max_region = max(regions, key=lambda r: r.area)
+    region_label = max_region.label
+    # Create a boolean mask of only that region
+    largest_region_mask = (labels == region_label)
+    # compute ratio of largest region to total image pixels
+    total_pixels = mask.size
+    ratio = max_region.area / total_pixels
+    print(f"DEBUG: Largest region area = {max_region.area} px, "
+          f"Total pixels = {total_pixels} px, "
+          f"Ratio = {ratio:.4f}")
+    # Show the largest region with mask=True rendered as black
+    plt.figure()
+    # use inverted gray so True→0 (black) and False→1 (white)
+    plt.imshow(largest_region_mask, cmap='gray_r', vmin=0, vmax=1)
+    plt.title(f'Largest region (label={region_label}, area={max_region.area} px)')
+    plt.axis('off')
+    plt.show()
+    
+    # NEW DEBUG PLOT: total pixel count vs region size
+    from collections import Counter
+    area_counts = Counter(areas)
+    unique_areas = sorted(area_counts)
+    total_pixels_per_area = [area_counts[a] * a for a in unique_areas]
+    log_area = np.log10(unique_areas)
+    plt.figure()
+    # plot log10(region area) on x-axis, total pixels on y-axis
+    plt.plot(log_area, total_pixels_per_area, marker='o', linestyle='-')
+    plt.xlabel('log10(region area)')
+    plt.ylabel('Total pixels across regions of that area')
+    plt.title('Pixel count by region size')
+    plt.show()
+
+    # Compute radius from peaks in pixel‑count curve
+    logA = np.log10(unique_areas)
+    counts = total_pixels_per_area
+
+    # find all peaks in the pixel‑count curve
+    peaks, _ = find_peaks(counts)
+    # select only those in the bead‑expected log‑area window (e.g. 2.2–2.7)
+    bead_peak_idxs = [i for i in peaks if 2.2 <= logA[i] <= 2.7]
+    bead_areas = [unique_areas[i] for i in bead_peak_idxs]
+    # convert to radii and report
+    bead_radii = [np.sqrt(a/np.pi) for a in bead_areas]
+    print("DEBUG: Detected bead‑size peaks at areas:", bead_areas)
+    print("DEBUG: => estimated radii (px):", [f"{r:.1f}" for r in bead_radii])
+
+    # optionally pick the most prominent peak
+    if bead_areas:
+        # choose the peak with highest total_pixels_per_area
+        best = bead_peak_idxs[np.argmax([counts[i] for i in bead_peak_idxs])]
+        best_area, best_radius = unique_areas[best], np.sqrt(unique_areas[best]/np.pi)
+        print(f"DEBUG: Auto‑picked bead radius: {best_radius:.1f} px (area={best_area})")
+        radius = best_radius
+    else:
+        print("DEBUG: No bead‑size peaks found; falling back to median.")
+        radius = np.median(areas)**0.5/np.sqrt(np.pi)
+
+    return radius
 
 
 def detect_bead_centers(combined_mask, radius):
@@ -94,8 +174,23 @@ def main():
                    help='Prefix for outputs')
     args = p.parse_args()
 
-    # 1) Load and combine masks
+    # 1) Load masks (white areas → True), then invert the black mask
     yellow_mask, red_mask, black_mask = load_masks(args.masks)
+    # we want True == black pixels, not white
+    black_mask = np.logical_not(black_mask)
+
+    # DEBUG: count and compare truly‑black pixels vs largest connected black region
+    total_black = int(np.sum(black_mask))
+    labels_black = label(black_mask, background=0)
+    regions_black = [r for r in regionprops(labels_black) if r.area > 0]
+    if regions_black:
+        max_b = max(regions_black, key=lambda r: r.area)
+        print(f"DEBUG: Total black pixels = {total_black} px")
+        print(f"DEBUG: Largest black region area = {max_b.area} px")
+        print(f"DEBUG: Ratio largest/total black = {max_b.area/total_black:.4f}")
+    else:
+        print("DEBUG: No black regions found in mask.")
+
     combined = yellow_mask | red_mask | black_mask
 
     # 2) Estimate bead radius & detect centers
@@ -104,6 +199,9 @@ def main():
     centers = detect_bead_centers(combined, radius)
     n_detected = len(centers)
     print(f"Detected {n_detected} bead centers.")
+
+    if n_detected == 0:
+        sys.exit("Error: No bead centers detected. Check your masks and blob_log threshold.")
 
     # 3) Infer total beads via rows
     rows = int(round(n_detected / args.beads_per_row))
@@ -149,4 +247,7 @@ def main():
     print(f"Saved centers, bead_order, and color sequence with prefix '{args.output_prefix}'")
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\nInterrupted by user")
