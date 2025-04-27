@@ -96,7 +96,8 @@ def estimate_bead_radius(mask):
     peaks, _ = find_peaks(counts)
     # select only those in the bead‑expected log‑area window (e.g. 2.2–2.7)
     bead_peak_idxs = [i for i in peaks if 2.2 <= logA[i] <= 2.7]
-    bead_areas = [unique_areas[i] for i in bead_peak_idxs]
+    # ensure native Python floats for clean printing
+    bead_areas = [float(unique_areas[i]) for i in bead_peak_idxs]
     # convert to radii and report
     bead_radii = [np.sqrt(a/np.pi) for a in bead_areas]
     print("DEBUG: Detected bead‑size peaks at areas:", bead_areas)

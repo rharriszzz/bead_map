@@ -3,6 +3,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from skimage import measure, morphology, filters
+from skimage.io import imread
 from scipy.interpolate import splprep, splev
 from sklearn.linear_model import RANSACRegressor
 from scipy.ndimage import gaussian_filter
@@ -10,117 +11,134 @@ from scipy.ndimage import gaussian_filter
 # --- File renamed to: Bracelet Pattern Extractor ---
 
 
-def detect_beads_from_mask(mask, estimated_bead_area, area_tolerance=0.3, smoothing_sigma=0.5, plot_debug=False):
-    mask = (mask < 128).astype(np.uint8)
-
-    if smoothing_sigma > 0:
-        mask = gaussian_filter(mask.astype(float), sigma=smoothing_sigma)
-        threshold = filters.threshold_otsu(mask)
-        binary = mask > threshold
-    else:
-        binary = mask > 0
-
-    labeled_mask = measure.label(binary)
-    props = measure.regionprops(labeled_mask)
-
-    area_min = estimated_bead_area * (1 - area_tolerance)
-    area_max = estimated_bead_area * (1 + area_tolerance)
-
-    bead_list = []
-    for p in props:
-        if area_min <= p.area <= area_max:
-            bead_info = {
-                'x': p.centroid[1],
-                'y': p.centroid[0],
-                'area': p.area,
-                'major_axis': p.major_axis_length,
-                'minor_axis': p.minor_axis_length,
-                'orientation': p.orientation
-            }
-            bead_list.append(bead_info)
-
-    if plot_debug:
-        fig, ax = plt.subplots(figsize=(8, 8))
-        ax.imshow(binary, cmap='gray')
-        for bead in bead_list:
-            ax.plot(bead['x'], bead['y'], 'ro')
-        ax.set_title(f"Detected {len(bead_list)} beads")
-        plt.show()
-
-    return bead_list
-
-
-
-def detect_beads_from_mask(mask, estimated_bead_area, area_tolerance=0.3, smoothing_sigma=0.5, plot_debug=False):
+def detect_beads_from_mask(mask, area_min, area_max,
+                           smoothing_sigma=0, plot_debug=False,
+                           bucket_size=20):
     """
     Detect bead centers from a binary mask, using area filtering.
 
     Args:
         mask (np.ndarray): Input binary mask (beads = black or 1, background = white or 0).
-        estimated_bead_area (float): Estimated area of a bead in pixels.
-        area_tolerance (float): Acceptable relative variation (e.g., 0.3 means +/-30%).
+        area_min (float): Minimum area of a bead in pixels.
+        area_max (float): Maximum area of a bead in pixels.
         smoothing_sigma (float): Optional Gaussian blur before processing.
         plot_debug (bool): If True, plot intermediate steps.
+        bucket_size (int): Size of buckets for region size debugging.
 
     Returns:
         List of bead properties: each as a dict with x, y, area, major_axis, minor_axis, orientation.
     """
-    from scipy.ndimage import gaussian_filter
 
     # Step 1: Preprocessing
-    mask = (mask < 128).astype(np.uint8)  # Ensure beads are 1, background is 0
-
-    if smoothing_sigma > 0:
-        mask = gaussian_filter(mask.astype(float), sigma=smoothing_sigma)
-        threshold = filters.threshold_otsu(mask)
-        binary = mask > threshold
+    # If the input is already a boolean mask (black=True), use it directly
+    if mask.dtype == bool:
+        binary = mask
     else:
-        binary = mask > 0
+        # convert image to boolean: black (<128) → True, white → False
+        mask_bool = (mask < 128)
+        if smoothing_sigma > 0:
+            blurred = gaussian_filter(mask_bool.astype(float), sigma=smoothing_sigma)
+            threshold = filters.threshold_otsu(blurred)
+            binary = blurred > threshold
+        else:
+            binary = mask_bool
 
     # Step 2: Label regions
     labeled_mask = measure.label(binary)
     props = measure.regionprops(labeled_mask)
 
-    # Step 3: Area-based filtering
-    area_min = estimated_bead_area * (1 - area_tolerance)
-    area_max = estimated_bead_area * (1 + area_tolerance)
+    # DEBUG: bucket region sizes into ranges and plot total pixels per bucket
+    sizes = [p.area for p in props]
+    if sizes:
+        max_size = max(sizes)
+        # create buckets: 0–(bucket_size-1), bucket_size–(2*bucket_size-1), ...
+        bins = list(range(0, int(max_size) + bucket_size, bucket_size))
+        bin_centers = [(b + bucket_size/2) for b in bins[:-1]]
+        pixels_per_bin = []
+        for start in bins[:-1]:
+            end = start + bucket_size
+            pixels = sum(a for a in sizes if start <= a < end)
+            pixels_per_bin.append(pixels)
 
+        # filter out empty buckets
+        plot_centers = [c for c, p in zip(bin_centers, pixels_per_bin) if p > 0]
+        plot_pixels = [p for p in pixels_per_bin if p > 0]
+        plt.figure()
+        plt.plot(plot_centers, plot_pixels,
+                 marker='o', linestyle='None', markersize=3)
+        plt.xlabel('Region size bucket center (pixels)')
+        plt.ylabel('Total pixels in bucket')
+        plt.title(f'Pixel count by region size (bucket={bucket_size})')
+        plt.show()
+
+    # Step 3: Area-based filtering (area_min and area_max are passed in)
     bead_list = []
     for p in props:
         if area_min <= p.area <= area_max:
             bead_info = {
-                'x': p.centroid[1],  # (row, col) -> (y, x)
-                'y': p.centroid[0],
-                'area': p.area,
-                'major_axis': p.major_axis_length,
-                'minor_axis': p.minor_axis_length,
-                'orientation': p.orientation  # Radians, CCW from x-axis
+                'x': float(p.centroid[1]),   # ensure native Python float
+                'y': float(p.centroid[0]),
+                'area': float(p.area),
+                'major_axis': float(p.major_axis_length),
+                'minor_axis': float(p.minor_axis_length),
+                'orientation': float(p.orientation)  # Radians, CCW from x-axis
             }
             bead_list.append(bead_info)
 
     if plot_debug:
         fig, ax = plt.subplots(figsize=(8, 8))
-        ax.imshow(binary, cmap='gray')
+        # display True→black, False→white
+        ax.imshow(binary, cmap='gray_r', vmin=0, vmax=1)
         for bead in bead_list:
-            ax.plot(bead['x'], bead['y'], 'ro')
+            # half the previous size
+            ax.plot(bead['x'], bead['y'], 'ro', markersize=2)
         ax.set_title(f"Detected {len(bead_list)} beads")
         plt.show()
 
     return bead_list
 
 
-# Example usage
-if __name__ == "__main__":
-    from skimage.io import imread
-
-    mask_path = "beads-photo-2-yellow.jpg"  # your mask image
-    mask = imread(mask_path)
-
+def main():
+    # estimated radius/area and filter bounds
     estimated_radius = 12.5  # pixels, as found before
     estimated_area = np.pi * estimated_radius**2
+    area_tolerance = 0.6
+    area_min = estimated_area * (1 - area_tolerance)
+    area_max = estimated_area * (1 + area_tolerance)
+    print(f"Area filter: min={area_min:.2f} px^2, max={area_max:.2f} px^2")
 
-    beads = detect_beads_from_mask(mask, estimated_bead_area=estimated_area, plot_debug=True)
+    runs = {
+        "yellow": ["beads-photo-2-yellow.jpg"],
+        "yellow+red": ["beads-photo-2-yellow.jpg", "beads-photo-2-red.jpg"],
+        "yellow+red+black": [
+            "beads-photo-2-yellow.jpg",
+            "beads-photo-2-red.jpg",
+            "beads-photo-2-black.jpg",
+        ],
+    }
 
-    print(f"Found {len(beads)} beads.")
-    for bead in beads[:5]:
-        print(bead)
+    for name, paths in runs.items():
+        # load & threshold each mask (<128 → True)
+        imgs = [imread(p) for p in paths]
+        combined = (imgs[0] < 128)
+        for img in imgs[1:]:
+            combined |= (img < 128)
+
+        print(f"\n=== Running on '{name}' mask(s): {paths} ===")
+        beads = detect_beads_from_mask(
+            combined,
+            area_min,
+            area_max,
+            plot_debug=True
+        )
+        print(f"Found {len(beads)} beads for '{name}'.")
+        for bead in beads[:5]:
+            print(bead)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        import sys
+        sys.exit("\nInterrupted by user")
