@@ -4,11 +4,36 @@ import numpy as np
 import matplotlib.pyplot as plt
 from skimage import measure, morphology, filters
 from skimage.io import imread
+from skimage.morphology import binary_closing, remove_small_objects, disk, skeletonize
+from skimage.graph import route_through_array
+from scipy.spatial import distance
 from scipy.interpolate import splprep, splev
 from sklearn.linear_model import RANSACRegressor
-from scipy.ndimage import gaussian_filter
 
-# --- File renamed to: Bracelet Pattern Extractor ---
+# x_centerline, y_centerline = compute_bracelet_centerline_spline('yellow_mask.png', 'red_mask.png', 'black_mask.png')
+def compute_bracelet_centerline_spline(yellow_path, red_path, black_path, smoothing=5.0, n_points=1000):
+    yellow_mask = imread(yellow_path, as_gray=True)
+    red_mask = imread(red_path, as_gray=True)
+    black_mask = imread(black_path, as_gray=True)
+    combined_mask = (yellow_mask < 128) | (red_mask < 128) | (black_mask < 128)
+    combined_mask = binary_closing(combined_mask, disk(3))
+    combined_mask = remove_small_objects(combined_mask, min_size=64)
+    skeleton = skeletonize(combined_mask)
+    coords = np.column_stack(np.nonzero(skeleton))
+    if len(coords) < 2:
+        raise ValueError("Skeletonization failed to produce enough points.")
+    dist_matrix = distance.cdist(coords, coords, 'euclidean')
+    i, j = np.unravel_index(np.argmax(dist_matrix), dist_matrix.shape)
+    start, end = tuple(coords[i]), tuple(coords[j])
+    cost_array = np.where(skeleton, 1, 1000)
+    indices, _ = route_through_array(cost_array, start, end, fully_connected=True)
+    ordered_coords = np.array(indices)
+    x = ordered_coords[:, 1]
+    y = ordered_coords[:, 0]
+    tck, u = splprep([x, y], s=smoothing)
+    u_fine = np.linspace(0, 1, n_points)
+    x_fine, y_fine = splev(u_fine, tck)
+    return x_fine, y_fine
 
 
 def detect_beads_from_mask(mask, area_min, area_max,
